@@ -1,0 +1,149 @@
+---
+# VyOS (network_driver `vyos`). Interface data comes from the OPERATIONAL state, `ip -j -d addr`, which
+# VyOS op mode runs and prints as JSON, so no TextFSM/TTP templates are needed. `show configuration json`
+# is not used: it reports `address: dhcp` rather than the address the router holds, and has no MAC or
+# link state.
+#
+# Requires Netmiko to strip ANSI escapes for VyOS: VyOS's shell emits `ESC[?2004l` (bracketed paste)
+# before each output, so `json.loads` fails and every JSON-derived field comes back empty. Netmiko 4.8.0's
+# VyOS driver does not set `ansi_escape_codes = True` (Arista's driver does).
+#
+# Skipped as interfaces: `lo`, VRF devices (info_kind vrf: VyOS makes one per VRF; they are not ports) and
+# `ifb` (traffic-shaping redirect devices). A VRF is reported on its member interface, from `master`.
+# Tested against VyOS rolling 2026.09.
+sync_devices:
+  hostname:
+    commands:
+      - command: "show host name"
+        parser: "raw"
+        jpath: "raw"
+        post_processor: "{{ obj.strip() }}"
+  serial:
+    commands:
+      - command: "show version"
+        parser: "raw"
+        jpath: "raw"
+        post_processor: "{{ obj.split('Hardware S/N:')[1].splitlines()[0].strip() if 'Hardware S/N:' in obj else '' }}"
+  # A fixed device type rather than the hardware string: VyOS is usually virtual, and `show version` then reports
+  # the hypervisor's model (`VC2` on Vultr, a VMware or KVM model elsewhere), which would create one device type
+  # per hypervisor.
+  device_type:
+    commands:
+      - command: "show host name"
+        parser: "raw"
+        jpath: "raw"
+        post_processor: "VyOS"
+  mgmt_interface:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        jpath: "[?addr_info[?local=='{{ obj }}']].ifname"
+        post_processor: "{{ obj[0] }}"
+  mask_length:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        jpath: "[].addr_info[?local=='{{ obj }}'].prefixlen[]"
+        post_processor: "{{ obj[0] }}"
+        iterable_type: "int"
+sync_network_data:
+  serial:
+    commands:
+      - command: "show version"
+        parser: "raw"
+        jpath: "raw"
+        post_processor: "{{ obj.split('Hardware S/N:')[1].splitlines()[0].strip() if 'Hardware S/N:' in obj else '' }}"
+  interfaces:
+    root_key: true
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        # Also skipped: the kernel's fallback tunnel devices, which exist whenever their module is loaded and are
+        # never configured (gre0, gretap0, erspan0, ip6tnl0, ip6gre0, sit0, tunl0).
+        jpath: "[?ifname!='lo' && (linkinfo.info_kind || '') != 'vrf' && (linkinfo.info_kind || '') != 'ifb' && !contains(['gre0', 'gretap0', 'erspan0', 'ip6tnl0', 'ip6gre0', 'sit0', 'tunl0'], ifname)].ifname"
+        post_processor: "{% set result={} %}{% for interface in obj %}{{ result.update({interface: {}}) or '' }}{% endfor %}{{ result | tojson }}"
+  interfaces__type:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        jpath: "[?ifname=='{{ current_key }}'].linkinfo.info_kind"
+        post_processor: "{{ 'virtual' if obj else 'other' }}"
+  interfaces__ip_addresses:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        jpath: "[?ifname=='{{ current_key }}'].addr_info[] | [?scope=='global'].{ip_address: local, prefix_length: prefixlen}"
+        post_processor: "{{ obj | tojson }}"
+  interfaces__mtu:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        jpath: "[?ifname=='{{ current_key }}'].mtu"
+        post_processor: "{{ obj[0] }}"
+        iterable_type: "str"
+  interfaces__mac_address:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        # Ethernet links only: on a tunnel `address` is its local IP (a gretap reports e.g. 10.10.0.0), and one
+        # invalid MAC fails the whole device's interface load ("address '10.10.0.0' is not an EUIv48").
+        jpath: "[?ifname=='{{ current_key }}' && link_type=='ether'].address"
+        post_processor: "{{ obj[0] if obj else '' }}"
+        iterable_type: "str"
+  interfaces__description:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        jpath: "[?ifname=='{{ current_key }}'].ifalias"
+        post_processor: "{{ obj[0] if obj else '' }}"
+        iterable_type: "str"
+  interfaces__link_status:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        jpath: "[?ifname=='{{ current_key }}'].operstate"
+        post_processor: "{{ (obj[0] in ['UP', 'UNKNOWN']) if obj else False }}"
+  interfaces__802.1Q_mode:
+    commands:
+      - command: "show host name"
+        parser: "raw"
+        jpath: "raw"
+        # `{{ '' }}`, never `""`: an empty post_processor is treated as absent, and the raw output (the hostname)
+        # is passed through as the value.
+        post_processor: "{{ '' }}"
+        iterable_type: "str"
+  interfaces__lag:
+    commands:
+      - command: "show host name"
+        parser: "raw"
+        jpath: "raw"
+        # `{{ '' }}`, never `""`: an empty post_processor is treated as absent, and the raw output (the hostname)
+        # is passed through as the value.
+        post_processor: "{{ '' }}"
+        iterable_type: "str"
+  interfaces__vrf:
+    commands:
+      - command: "ip -j -d addr"
+        parser: "none"
+        jpath: "[?ifname=='{{ current_key }}'].master"
+        post_processor: "{% if obj and not obj[0].startswith('br') %}{{ {'name': obj[0]} | tojson }}{% else %}{{ {} | tojson }}{% endif %}"
+        iterable_type: "dict"
+  interfaces__tagged_vlans:
+    commands:
+      - command: "show host name"
+        parser: "raw"
+        jpath: "raw"
+        post_processor: "{{ [] | tojson }}"
+  interfaces__untagged_vlan:
+    commands:
+      - command: "show host name"
+        parser: "raw"
+        jpath: "raw"
+        post_processor: "{{ {} | tojson }}"
+        iterable_type: "dict"
+  software_version:
+    commands:
+      - command: "show version"
+        parser: "raw"
+        jpath: "raw"
+        post_processor: "{{ obj.split('Version:')[1].splitlines()[0].strip() if 'Version:' in obj else '' }}"
