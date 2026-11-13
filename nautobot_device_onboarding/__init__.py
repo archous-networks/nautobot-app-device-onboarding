@@ -5,7 +5,31 @@ from importlib import metadata
 
 from nautobot.apps import NautobotAppConfig
 
-__version__ = metadata.version(__name__)
+
+
+def _version():
+    """The installed distribution's version, or the source checkout's when the app runs uninstalled.
+
+    An app can be put on the import path without being pip-installed (a git checkout on PYTHONPATH, a
+    bind-mounted apps directory). It then has no package metadata and `metadata.version` raises
+    PackageNotFoundError, which Nautobot reports as "Unable to import plugin" and refuses to start.
+    """
+    try:
+        return metadata.version(__name__)
+    except metadata.PackageNotFoundError:
+        import pathlib  # pylint: disable=import-outside-toplevel
+
+        pyproject = pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml"
+        try:
+            import tomllib  # pylint: disable=import-outside-toplevel  # Python 3.11+
+
+            with pyproject.open("rb") as handle:
+                return tomllib.load(handle)["tool"]["poetry"]["version"]
+        except (ImportError, OSError, KeyError, ValueError):  # TOMLDecodeError is a ValueError
+            return "0.0.0"
+
+
+__version__ = _version()
 
 
 class NautobotDeviceOnboardingConfig(NautobotAppConfig):
